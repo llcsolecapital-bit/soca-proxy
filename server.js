@@ -10,46 +10,97 @@ const FINNHUB_KEY = process.env.FINNHUB_KEY;
 app.use(cors());
 app.use(express.json());
 
-app.get('/', (req, res) => {
-  res.json({
-    status: 'SOCA Proxy running',
-    polygon: POLYGON_KEY ? 'configured' : 'missing',
-    finnhub: FINNHUB_KEY ? 'configured' : 'missing'
-  });
-});
+// ── PRICE CACHE ──────────────────────────────────────────────────────────────
+// Prices are fetched server-side every 30s and cached here
+// Dashboard reads from cache — zero API calls on page load/refresh
+let priceCache = {};       // sym → Finnhub quote object
+let lastCacheUpdate = null;
+let cacheReady = false;
 
-// Batch quotes via Finnhub — fetches all symbols in parallel server-side
-// No browser rate limit issues, returns all in ~2-3 seconds
-app.get('/quote/:symbols', async (req, res) => {
-  if (!FINNHUB_KEY) return res.status(500).json({ error: 'FINNHUB_KEY not set on Railway' });
+const SYMBOLS = [
+  'AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','AVGO','ORCL','ASML',
+  'SPY','QQQ','IWM','DIA','XLK','XLF','XLE',
+  'AMD','INTC','QCOM','MU','AMAT','LRCX','KLAC','TXN','MRVL','ARM',
+  'JPM','BAC','WFC','GS','MS','BLK','V','MA','PYPL','AXP',
+  'LLY','JNJ','UNH','ABBV','PFE','MRK','TMO','ABT','DHR','AMGN',
+  'WMT','COST','HD','MCD','SBUX','NKE','TGT','LOW','TJX',
+  'XOM','CVX','COP','SLB','EOG',
+  'NFLX','DIS','CMCSA','T','VZ','TMUS','SPOT',
+  'CAT','DE','BA','RTX','HON','GE','UPS','FDX','LMT','NOC',
+  'CRM','ADBE','NOW','INTU','SNOW','PLTR','UBER','ABNB','COIN','SHOP',
+  'SPGI','MCO','CB','MMM','PG','KO','PEP','PM','MO'
+];
+
+async function refreshPriceCache() {
+  if (!FINNHUB_KEY) return;
   try {
-    const syms = [...new Set(req.params.symbols.toUpperCase().split(','))];
-
-    // Fetch all in parallel — server has no CORS restriction
+    // Fetch all in parallel — server-side no CORS/rate limit issues from browser
     const results = await Promise.all(
-      syms.map(async sym => {
+      SYMBOLS.map(async sym => {
         try {
-          const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
+          const r = await fetch(
+            `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`,
+            { timeout: 8000 }
+          );
           const q = await r.json();
-          if (!q.c || q.c === 0) return null;
-          return {
-            ticker: sym,
-            lastTrade: { p: q.c },
-            day: { o: q.o, h: q.h, l: q.l, c: q.c, v: 0 },
-            prevDay: { c: q.pc },
-            finnhub: q  // includes d (change $), dp (change %), pc (prev close)
-          };
+          if (q.c && q.c > 0) return { sym, quote: q };
+          return null;
         } catch(e) { return null; }
       })
     );
 
-    res.json({ tickers: results.filter(Boolean) });
+    let updated = 0;
+    results.forEach(item => {
+      if (!item) return;
+      priceCache[item.sym] = {
+        ticker: item.sym,
+        lastTrade: { p: item.quote.c },
+        day: { o: item.quote.o, h: item.quote.h, l: item.quote.l, c: item.quote.c, v: 0 },
+        prevDay: { c: item.quote.pc },
+        finnhub: item.quote
+      };
+      updated++;
+    });
+
+    lastCacheUpdate = new Date().toISOString();
+    cacheReady = true;
+    console.log(`Cache updated: ${updated}/${SYMBOLS.length} symbols at ${lastCacheUpdate}`);
   } catch(e) {
-    res.status(500).json({ error: e.message });
+    console.error('Cache refresh error:', e.message);
   }
+}
+
+// Start cache refresh loop immediately on boot
+refreshPriceCache();
+setInterval(refreshPriceCache, 30000); // refresh every 30s
+
+// ── ROUTES ────────────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status: 'SOCA Proxy running',
+    polygon: POLYGON_KEY ? 'configured' : 'missing',
+    finnhub: FINNHUB_KEY ? 'configured' : 'missing',
+    cacheReady,
+    lastCacheUpdate,
+    cachedSymbols: Object.keys(priceCache).length
+  });
 });
 
-// Candles via Polygon (still free for historical bars)
+// Quote endpoint — returns from cache instantly, zero Finnhub calls
+app.get('/quote/:symbols', (req, res) => {
+  const requested = [...new Set(req.params.symbols.toUpperCase().split(','))];
+  const tickers = requested
+    .map(sym => priceCache[sym] || null)
+    .filter(Boolean);
+  res.json({
+    tickers,
+    fromCache: true,
+    lastUpdate: lastCacheUpdate,
+    ready: cacheReady
+  });
+});
+
+// Candles via Polygon
 app.get('/candles/:sym/:mult/:span/:from/:to', async (req, res) => {
   if (!POLYGON_KEY) return res.status(500).json({ error: 'POLYGON_KEY not set' });
   try {
@@ -63,16 +114,29 @@ app.get('/candles/:sym/:mult/:span/:from/:to', async (req, res) => {
   }
 });
 
-// Debug
-app.get('/debug/:sym', async (req, res) => {
-  if (!FINNHUB_KEY) return res.status(500).json({ error: 'FINNHUB_KEY not set' });
-  try {
-    const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${req.params.sym.toUpperCase()}&token=${FINNHUB_KEY}`);
-    const q = await r.json();
-    res.json({ sym: req.params.sym.toUpperCase(), data: q });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+// Debug — single symbol from cache
+app.get('/debug/:sym', (req, res) => {
+  const sym = req.params.sym.toUpperCase();
+  const cached = priceCache[sym];
+  res.json({
+    sym,
+    found: !!cached,
+    price: cached?.finnhub?.c || null,
+    change: cached?.finnhub?.d || null,
+    changePct: cached?.finnhub?.dp || null,
+    lastUpdate: lastCacheUpdate,
+    cacheReady
+  });
 });
 
-app.listen(PORT, () => console.log(`SOCA Proxy listening on port ${PORT}`));
+// Force manual cache refresh (useful after deploy)
+app.get('/refresh', async (req, res) => {
+  await refreshPriceCache();
+  res.json({ ok: true, cachedSymbols: Object.keys(priceCache).length, lastUpdate: lastCacheUpdate });
+});
+
+app.listen(PORT, () => {
+  console.log(`SOCA Proxy listening on port ${PORT}`);
+  console.log(`Finnhub key: ${FINNHUB_KEY ? 'set' : 'MISSING'}`);
+  console.log(`Polygon key: ${POLYGON_KEY ? 'set' : 'MISSING'}`);
+});
