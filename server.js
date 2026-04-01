@@ -642,7 +642,16 @@ setInterval(checkScalpExits, 100); // Every 100ms
 // ══════════════════════════════════════════════════════════════════════════════
 // SCHWAB ORDER EXECUTION
 // ══════════════════════════════════════════════════════════════════════════════
+// SIMULATION MODE - Set to false to enable real trading
+const SIMULATION_MODE = true;
+
 async function placeSchwabOrder(sym, side, qty, price) {
+  // Force simulation mode - no real orders
+  if (SIMULATION_MODE) {
+    console.log(`📝 SIMULATED: ${side} ${qty} ${sym} @ $${price.toFixed(2)}`);
+    return { simulated: true, side, sym, qty, price };
+  }
+
   const token = await getSchwabToken();
   const hash = await getSchwabAccountHash();
   
