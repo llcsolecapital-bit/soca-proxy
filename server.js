@@ -1,21 +1,29 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const cors = require('cors');
+const WebSocket = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const POLYGON_KEY   = process.env.POLYGON_KEY;
-const FINNHUB_KEY   = process.env.FINNHUB_KEY;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ══════════════════════════════════════════════════════════════════════════════
 const SCHWAB_KEY    = process.env.SCHWAB_KEY;
 const SCHWAB_SECRET = process.env.SCHWAB_SECRET;
 const REDIRECT_URI  = process.env.REDIRECT_URI || 'https://soca-proxy-production.up.railway.app/callback';
 const TG_TOKEN      = process.env.TG_TOKEN;
 const TG_CHAT       = process.env.TG_CHAT;
 
+// Account config - $200k paper account
+const ACCOUNT_BALANCE = 200000;
+
 app.use(cors());
 app.use(express.json());
 
-// ── TELEGRAM ──────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
 async function tg(msg) {
   if (!TG_TOKEN || !TG_CHAT) return;
   try {
@@ -24,11 +32,21 @@ async function tg(msg) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'Markdown' })
     });
-  } catch(e) {}
+  } catch(e) { console.error('Telegram error:', e.message); }
 }
 
-// ── SCHWAB AUTH ───────────────────────────────────────────────────────────────
-let schwabTokens = { access_token: null, refresh_token: null, expires_at: null, account_hash: null };
+// ══════════════════════════════════════════════════════════════════════════════
+// SCHWAB AUTHENTICATION
+// ══════════════════════════════════════════════════════════════════════════════
+let schwabTokens = { 
+  access_token: null, 
+  refresh_token: null, 
+  expires_at: null, 
+  account_hash: null,
+  streamer_url: null,
+  streamer_socket_url: null,
+  customer_id: null
+};
 
 function schwabReady() {
   return schwabTokens.access_token && Date.now() < (schwabTokens.expires_at || 0);
@@ -48,12 +66,15 @@ async function refreshSchwabToken() {
       schwabTokens.access_token  = d.access_token;
       schwabTokens.refresh_token = d.refresh_token || schwabTokens.refresh_token;
       schwabTokens.expires_at    = Date.now() + (d.expires_in - 60) * 1000;
-      console.log('Schwab token refreshed');
+      console.log('✓ Schwab token refreshed');
       return true;
     }
-    console.error('Schwab refresh failed:', JSON.stringify(d));
+    console.error('✗ Schwab refresh failed:', JSON.stringify(d));
     return false;
-  } catch(e) { console.error('Schwab refresh error:', e.message); return false; }
+  } catch(e) { 
+    console.error('✗ Schwab refresh error:', e.message); 
+    return false; 
+  }
 }
 
 async function getSchwabToken() {
@@ -76,225 +97,560 @@ async function getSchwabAccountHash() {
     const d = await r.json();
     if (d && d[0]) {
       schwabTokens.account_hash = d[0].hashValue;
-      console.log('Got account hash:', schwabTokens.account_hash);
+      console.log('✓ Got account hash:', schwabTokens.account_hash);
       return schwabTokens.account_hash;
     }
-  } catch(e) { console.error('Account hash error:', e.message); }
+  } catch(e) { console.error('✗ Account hash error:', e.message); }
+  return null;
+}
+
+// Get user preferences for streaming connection
+async function getUserPreferences() {
+  const token = await getSchwabToken();
+  if (!token) return null;
+  try {
+    const r = await fetch('https://api.schwabapi.com/trader/v1/userPreference', {
+      headers: { 'Authorization': `Bearer ${token}` }
+    });
+    const prefs = await r.json();
+    if (prefs.streamerInfo) {
+      schwabTokens.streamer_socket_url = prefs.streamerInfo[0]?.streamerSocketUrl;
+      schwabTokens.customer_id = prefs.streamerInfo[0]?.schwabClientCustomerId;
+      console.log('✓ Got streamer info:', schwabTokens.streamer_socket_url);
+      return prefs;
+    }
+  } catch(e) { console.error('✗ User prefs error:', e.message); }
   return null;
 }
 
 // Refresh token every 25 min
-setInterval(async () => { if (schwabTokens.refresh_token) await refreshSchwabToken(); }, 25 * 60 * 1000);
+setInterval(async () => { 
+  if (schwabTokens.refresh_token) await refreshSchwabToken(); 
+}, 25 * 60 * 1000);
 
-// ── PRICE CACHE ───────────────────────────────────────────────────────────────
-let priceCache = {};
-let lastCacheUpdate = null;
-let cacheReady = false;
-let dataSource = 'none';
-
-const SYMBOLS = [
-  'AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','AVGO','ORCL','ASML',
-  'SPY','QQQ','IWM','DIA','XLK','XLF','XLE',
-  'AMD','INTC','QCOM','MU','AMAT','LRCX','KLAC','TXN','MRVL','ARM',
-  'JPM','BAC','WFC','GS','MS','BLK','V','MA','PYPL','AXP',
-  'LLY','JNJ','UNH','ABBV','PFE','MRK','TMO','ABT','DHR','AMGN',
-  'WMT','COST','HD','MCD','SBUX','NKE','TGT','LOW','TJX',
-  'XOM','CVX','COP','SLB','EOG',
-  'NFLX','DIS','CMCSA','T','VZ','TMUS','SPOT',
-  'CAT','DE','BA','RTX','HON','GE','UPS','FDX','LMT','NOC',
-  'CRM','ADBE','NOW','INTU','SNOW','PLTR','UBER','ABNB','COIN','SHOP',
-  'SPGI','MCO','CB','MMM','PG','KO','PEP','PM','MO'
+// ══════════════════════════════════════════════════════════════════════════════
+// SYMBOLS TO TRADE
+// ══════════════════════════════════════════════════════════════════════════════
+const SCALP_SYMBOLS = [
+  // Large caps - high liquidity, tight spreads
+  'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META',
+  // ETFs - extremely liquid
+  'SPY', 'QQQ', 'IWM',
+  // High volatility - more scalping opportunities
+  'TSLA', 'COIN', 'PLTR'
 ];
 
-// Fetch from Schwab (real-time, best quality)
+const OPTIONS_SYMBOLS = [
+  'SPY', 'QQQ', 'AAPL', 'MSFT', 'NVDA', 'TSLA'
+];
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REAL-TIME PRICE CACHE (updated by WebSocket)
+// ══════════════════════════════════════════════════════════════════════════════
+let priceCache = {};
+let tickHistory = {}; // Last N ticks per symbol for micro-momentum
+let lastCacheUpdate = null;
+let dataSource = 'none';
+
+// Initialize tick history
+SCALP_SYMBOLS.forEach(sym => { tickHistory[sym] = []; });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SCHWAB WEBSOCKET STREAMING
+// ══════════════════════════════════════════════════════════════════════════════
+let streamerWs = null;
+let streamerConnected = false;
+let streamerRequestId = 0;
+
+function getNextRequestId() {
+  return ++streamerRequestId;
+}
+
+async function connectStreamer() {
+  if (!schwabReady()) {
+    console.log('⚠ Cannot connect streamer - Schwab not authenticated');
+    return false;
+  }
+
+  const prefs = await getUserPreferences();
+  if (!prefs || !schwabTokens.streamer_socket_url) {
+    console.log('⚠ Cannot get streamer URL');
+    return false;
+  }
+
+  return new Promise((resolve) => {
+    try {
+      console.log('🔌 Connecting to Schwab streamer...');
+      streamerWs = new WebSocket(schwabTokens.streamer_socket_url);
+
+      streamerWs.on('open', async () => {
+        console.log('🔌 WebSocket connected, logging in...');
+        
+        // Send login request
+        const loginRequest = {
+          requests: [{
+            requestid: getNextRequestId().toString(),
+            service: 'ADMIN',
+            command: 'LOGIN',
+            SchwabClientCustomerId: schwabTokens.customer_id,
+            SchwabClientCorrelId: `soca-${Date.now()}`,
+            parameters: {
+              Authorization: schwabTokens.access_token,
+              SchwabClientChannel: 'client',
+              SchwabClientFunctionId: 'soca-bot'
+            }
+          }]
+        };
+        
+        streamerWs.send(JSON.stringify(loginRequest));
+      });
+
+      streamerWs.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          handleStreamerMessage(msg);
+        } catch(e) {
+          console.error('✗ Streamer parse error:', e.message);
+        }
+      });
+
+      streamerWs.on('close', () => {
+        console.log('🔌 Streamer disconnected');
+        streamerConnected = false;
+        // Reconnect after 5 seconds
+        setTimeout(() => {
+          if (botRunning) connectStreamer();
+        }, 5000);
+      });
+
+      streamerWs.on('error', (err) => {
+        console.error('✗ Streamer error:', err.message);
+        resolve(false);
+      });
+
+      // Resolve after 5 seconds if connected
+      setTimeout(() => resolve(streamerConnected), 5000);
+
+    } catch(e) {
+      console.error('✗ Streamer connection error:', e.message);
+      resolve(false);
+    }
+  });
+}
+
+function handleStreamerMessage(msg) {
+  // Handle login response
+  if (msg.response) {
+    for (const resp of msg.response) {
+      if (resp.service === 'ADMIN' && resp.command === 'LOGIN') {
+        if (resp.content?.code === 0) {
+          console.log('✓ Streamer logged in successfully');
+          streamerConnected = true;
+          subscribeToQuotes();
+        } else {
+          console.error('✗ Streamer login failed:', resp.content);
+        }
+      }
+    }
+  }
+
+  // Handle data updates
+  if (msg.data) {
+    for (const item of msg.data) {
+      if (item.service === 'LEVELONE_EQUITIES') {
+        processQuoteUpdate(item.content);
+      }
+      if (item.service === 'TIMESALE_EQUITY') {
+        processTimeSale(item.content);
+      }
+    }
+  }
+}
+
+function subscribeToQuotes() {
+  if (!streamerConnected || !streamerWs) return;
+
+  console.log(`📊 Subscribing to ${SCALP_SYMBOLS.length} symbols...`);
+
+  // Subscribe to Level 1 quotes
+  const quoteRequest = {
+    requests: [{
+      requestid: getNextRequestId().toString(),
+      service: 'LEVELONE_EQUITIES',
+      command: 'SUBS',
+      SchwabClientCustomerId: schwabTokens.customer_id,
+      SchwabClientCorrelId: `soca-quotes-${Date.now()}`,
+      parameters: {
+        keys: SCALP_SYMBOLS.join(','),
+        fields: '0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52'
+      }
+    }]
+  };
+  
+  streamerWs.send(JSON.stringify(quoteRequest));
+
+  // Subscribe to Time & Sales for tick-by-tick
+  const timeSaleRequest = {
+    requests: [{
+      requestid: getNextRequestId().toString(),
+      service: 'TIMESALE_EQUITY',
+      command: 'SUBS',
+      SchwabClientCustomerId: schwabTokens.customer_id,
+      SchwabClientCorrelId: `soca-timesale-${Date.now()}`,
+      parameters: {
+        keys: SCALP_SYMBOLS.join(','),
+        fields: '0,1,2,3,4'
+      }
+    }]
+  };
+
+  streamerWs.send(JSON.stringify(timeSaleRequest));
+
+  // Set Quality of Service to Express (500ms)
+  const qosRequest = {
+    requests: [{
+      requestid: getNextRequestId().toString(),
+      service: 'ADMIN',
+      command: 'QOS',
+      SchwabClientCustomerId: schwabTokens.customer_id,
+      SchwabClientCorrelId: `soca-qos-${Date.now()}`,
+      parameters: {
+        qoslevel: '0' // Express = 500ms
+      }
+    }]
+  };
+
+  streamerWs.send(JSON.stringify(qosRequest));
+}
+
+function processQuoteUpdate(content) {
+  if (!Array.isArray(content)) return;
+  
+  for (const quote of content) {
+    const sym = quote.key;
+    if (!sym) continue;
+
+    const prev = priceCache[sym] || {};
+    
+    priceCache[sym] = {
+      ticker: sym,
+      lastPrice: quote['3'] || quote['LAST_PRICE'] || prev.lastPrice,
+      bidPrice: quote['1'] || quote['BID_PRICE'] || prev.bidPrice,
+      askPrice: quote['2'] || quote['ASK_PRICE'] || prev.askPrice,
+      bidSize: quote['4'] || quote['BID_SIZE'] || prev.bidSize,
+      askSize: quote['5'] || quote['ASK_SIZE'] || prev.askSize,
+      volume: quote['8'] || quote['TOTAL_VOLUME'] || prev.volume,
+      openPrice: quote['28'] || quote['OPEN_PRICE'] || prev.openPrice,
+      highPrice: quote['12'] || quote['HIGH_PRICE'] || prev.highPrice,
+      lowPrice: quote['11'] || quote['LOW_PRICE'] || prev.lowPrice,
+      closePrice: quote['15'] || quote['CLOSE_PRICE'] || prev.closePrice,
+      netChange: quote['18'] || quote['NET_CHANGE'] || prev.netChange,
+      netChangePct: quote['29'] || quote['NET_CHANGE_PCT'] || prev.netChangePct,
+      timestamp: Date.now()
+    };
+
+    dataSource = 'schwab-stream';
+    lastCacheUpdate = new Date().toISOString();
+  }
+}
+
+function processTimeSale(content) {
+  if (!Array.isArray(content)) return;
+  
+  for (const sale of content) {
+    const sym = sale.key;
+    if (!sym || !tickHistory[sym]) continue;
+
+    const tick = {
+      price: sale['2'] || sale['LAST_PRICE'],
+      size: sale['3'] || sale['LAST_SIZE'],
+      time: sale['1'] || Date.now()
+    };
+
+    if (tick.price) {
+      tickHistory[sym].push(tick);
+      // Keep last 100 ticks
+      if (tickHistory[sym].length > 100) {
+        tickHistory[sym].shift();
+      }
+
+      // Update last price
+      if (priceCache[sym]) {
+        priceCache[sym].lastPrice = tick.price;
+        priceCache[sym].timestamp = Date.now();
+      }
+
+      // Trigger scalp check on every tick when bot is running
+      if (botRunning) {
+        checkScalpSignal(sym, tick.price);
+      }
+    }
+  }
+}
+
+// Fallback: Poll Schwab quotes API if streaming fails
 async function fetchSchwabPrices() {
   const token = await getSchwabToken();
   if (!token) return false;
   try {
-    const symsParam = SYMBOLS.join('%2C');
-    const fields = 'quote,fundamental';
+    const symsParam = SCALP_SYMBOLS.join('%2C');
     const r = await fetch(
-      `https://api.schwabapi.com/marketdata/v1/quotes?symbols=${symsParam}&fields=${fields}&indicative=false`,
+      `https://api.schwabapi.com/marketdata/v1/quotes?symbols=${symsParam}&fields=quote&indicative=false`,
       { headers: { 'Authorization': `Bearer ${token}` } }
     );
-    if (!r.ok) { console.error('Schwab quotes error:', r.status); return false; }
+    if (!r.ok) return false;
     const d = await r.json();
-    let updated = 0;
-    for (const sym of SYMBOLS) {
+    
+    for (const sym of SCALP_SYMBOLS) {
       const q = d[sym]?.quote;
-      const f = d[sym]?.fundamental;
       if (!q || !q.lastPrice) continue;
+      
       priceCache[sym] = {
         ticker: sym,
-        lastTrade: { p: q.lastPrice },
-        day: {
-          o: q.openPrice || q.lastPrice,
-          h: q.highPrice || q.lastPrice,
-          l: q.lowPrice  || q.lastPrice,
-          c: q.lastPrice,
-          v: q.totalVolume || 0
-        },
-        prevDay: { c: q.closePrice || q.lastPrice },
-        schwab: {
-          c:  q.lastPrice,
-          o:  q.openPrice,
-          h:  q.highPrice,
-          l:  q.lowPrice,
-          pc: q.closePrice,       // prev close
-          d:  q.netChange,        // day change $
-          dp: q.netPercentChange, // day change %
-          preMarket:  q.preMarketPrice  || null,
-          afterHours: q.postMarketPrice || null,
-          preMarketChange:   q.preMarketChange   || null,
-          preMarketChangePct: q.preMarketPercentChange || null,
-          afterHoursChange:  q.postMarketChange  || null,
-          afterHoursChangePct: q.postMarketPercentChange || null,
-          bidPrice: q.bidPrice,
-          askPrice: q.askPrice,
-          volume:   q.totalVolume,
-          week52High: f?.['52WeekHigh'],
-          week52Low:  f?.['52WeekLow'],
-        }
+        lastPrice: q.lastPrice,
+        bidPrice: q.bidPrice,
+        askPrice: q.askPrice,
+        volume: q.totalVolume,
+        openPrice: q.openPrice,
+        highPrice: q.highPrice,
+        lowPrice: q.lowPrice,
+        closePrice: q.closePrice,
+        netChange: q.netChange,
+        netChangePct: q.netPercentChange,
+        timestamp: Date.now()
       };
-      updated++;
     }
-    dataSource = 'schwab';
+    
+    dataSource = 'schwab-poll';
     lastCacheUpdate = new Date().toISOString();
-    cacheReady = true;
-    console.log(`Schwab prices updated: ${updated} symbols`);
     return true;
-  } catch(e) { console.error('Schwab price fetch error:', e.message); return false; }
-}
-
-// Fallback: Finnhub
-async function fetchFinnhubPrices() {
-  if (!FINNHUB_KEY) return false;
-  try {
-    const results = await Promise.all(
-      SYMBOLS.map(async sym => {
-        try {
-          const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`);
-          const q = await r.json();
-          if (!q.c || q.c === 0) return null;
-          return { sym, quote: q };
-        } catch(e) { return null; }
-      })
-    );
-    let updated = 0;
-    results.forEach(item => {
-      if (!item) return;
-      const q = item.quote;
-      priceCache[item.sym] = {
-        ticker: item.sym,
-        lastTrade: { p: q.c },
-        day: { o: q.o, h: q.h, l: q.l, c: q.c, v: 0 },
-        prevDay: { c: q.pc },
-        finnhub: q
-      };
-      updated++;
-    });
-    dataSource = 'finnhub';
-    lastCacheUpdate = new Date().toISOString();
-    cacheReady = true;
-    console.log(`Finnhub prices updated: ${updated} symbols`);
-    return true;
-  } catch(e) { console.error('Finnhub error:', e.message); return false; }
-}
-
-async function refreshPriceCache() {
-  // Try Schwab first (real-time), fall back to Finnhub
-  const schwabOk = await fetchSchwabPrices();
-  if (!schwabOk) await fetchFinnhubPrices();
-}
-
-// Start cache refresh immediately and every 30s
-refreshPriceCache();
-setInterval(refreshPriceCache, 30000);
-
-// ── BOT ENGINE ────────────────────────────────────────────────────────────────
-let botRunning = false;
-let botPositions = {}; // sym → { qty, avgPrice, entryTime }
-let botSettings = {
-  slPct: 5, tpPct: 15, maxPosPct: 10, rsiB: 32, rsiS: 68, minConf: 75
-};
-let tradeLog = [];
-let cash = 1000; // paper cash tracking
-
-// Strategy indicators
-const mean = a => a.reduce((s,x)=>s+x,0)/a.length;
-function sma(a,n){if(a.length<n)return a[a.length-1];return mean(a.slice(-n));}
-function ema(a,n){if(a.length<n)return a[a.length-1];const k=2/(n+1);let e=mean(a.slice(0,n));for(let i=n;i<a.length;i++)e=a[i]*k+e*(1-k);return e;}
-function rsi(a,n=14){if(a.length<n+1)return 50;let g=0,l=0;for(let i=a.length-n;i<a.length;i++){const d=a[i]-a[i-1];d>0?g+=d:l-=d;}return 100-100/(1+(g/(l||1e-9)));}
-function bb(a,n=20){const m=sma(a,n);const sl=a.slice(-n);const sd=Math.sqrt(sl.reduce((s,p)=>s+(p-m)**2,0)/n);return{upper:m+2*sd,lower:m-2*sd,mid:m};}
-function roc(a,n=10){if(a.length<n+1)return 0;return(a[a.length-1]-a[a.length-1-n])/a[a.length-1-n]*100;}
-function atr(a,n=14){if(a.length<n+1)return(a[a.length-1]||100)*.02;let s=0;for(let i=a.length-n;i<a.length;i++){const h=a[i]*1.005,lv=a[i]*.995;s+=Math.max(h-lv,Math.abs(h-(a[i-1]||a[i])),Math.abs(lv-(a[i-1]||a[i])));}return s/n;}
-
-// Daily candle cache for indicators
-let dailyBars = {}; // sym → [closes]
-
-async function fetchDailyBars(sym) {
-  if (!POLYGON_KEY) return;
-  try {
-    const to = new Date().toISOString().split('T')[0];
-    const from = new Date(); from.setFullYear(from.getFullYear()-1);
-    const fromStr = from.toISOString().split('T')[0];
-    const r = await fetch(`https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/day/${fromStr}/${to}?adjusted=true&sort=asc&limit=365&apiKey=${POLYGON_KEY}`);
-    const d = await r.json();
-    if (d.results && d.results.length > 0) {
-      dailyBars[sym] = d.results.map(b => b.c);
-    }
-  } catch(e) {}
-}
-
-// Pre-fetch daily bars for all symbols at startup
-async function initDailyBars() {
-  console.log('Fetching daily bars for all symbols...');
-  for (const sym of SYMBOLS) {
-    await fetchDailyBars(sym);
-    await new Promise(r => setTimeout(r, 300));
+  } catch(e) { 
+    console.error('✗ Schwab poll error:', e.message); 
+    return false; 
   }
-  console.log(`Daily bars loaded for ${Object.keys(dailyBars).length} symbols`);
 }
-initDailyBars();
-// Refresh daily bars every 6 hours
-setInterval(initDailyBars, 6 * 60 * 60 * 1000);
 
-function analyze(sym) {
-  const closes = dailyBars[sym] || [];
-  const NONE = { buyGate: false, sellSignal: false, passed: 0, confidence: 0, trendScore: 0, mrScore: 0, rocVal: 0, atrVal: 0, rsiVal: 50 };
-  if (closes.length < 30) return NONE;
-  const p = priceCache[sym]?.schwab?.c || priceCache[sym]?.finnhub?.c || closes[closes.length-1];
-  const rsiV = rsi(closes), e9 = ema(closes,9), s20 = sma(closes,20);
-  const e21 = ema(closes,21), s50 = sma(closes,50);
-  const bands = bb(closes,20), rocV = roc(closes,10), atrV = atr(closes,14);
-  const vol = atrV / p;
-  let trendScore = 0;
-  if(e9>s20)trendScore++;if(e21>s50)trendScore++;if(p>s20)trendScore++;
-  if((ema(closes,12)-ema(closes,26))>0)trendScore++;
-  const trendBull = trendScore >= 3;
-  let mrScore = 0;
-  if(rsiV < botSettings.rsiB) mrScore+=2; else if(rsiV<40) mrScore+=1;
-  if(p < bands.lower) mrScore+=2; else if(p<bands.mid) mrScore+=1;
-  const meanBull = mrScore >= 2;
-  const momBull = rocV > 0.5;
-  const volOk = vol < 0.03;
-  const passed = [trendBull, meanBull, momBull, volOk].filter(Boolean).length;
-  return {
-    buyGate: trendBull && meanBull && momBull && volOk,
-    sellSignal: trendScore <= 1 || (rsiV > botSettings.rsiS && e9 < s20),
-    passed, confidence: passed * 25,
-    trendScore, mrScore, rocVal: rocV, atrVal: atrV, rsiVal: rsiV
+// Fallback polling every 5s if streaming not connected
+setInterval(async () => {
+  if (!streamerConnected && schwabReady()) {
+    await fetchSchwabPrices();
+  }
+}, 5000);
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HIGH-FREQUENCY SCALPING ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+let botRunning = false;
+let botPositions = {}; // sym → { qty, avgPrice, entryTime, side }
+let botSettings = {
+  // Scalping settings
+  scalp_tp_pct: 0.3,      // Take profit at 0.3%
+  scalp_sl_pct: 0.2,      // Stop loss at 0.2%
+  scalp_pos_pct: 5,       // 5% of account per position ($10k on $200k)
+  scalp_max_positions: 5, // Max concurrent positions
+  
+  // Options mean reversion
+  opt_rsi_buy: 28,        // Buy calls when RSI < 28
+  opt_rsi_sell: 72,       // Buy puts when RSI > 72
+  opt_bb_enabled: true,   // Also check Bollinger Bands
+  opt_days_to_exp: 30,    // ~30 DTE options
+  opt_tp_pct: 30,         // 30% take profit on options
+  opt_sl_pct: 25,         // 25% stop loss on options
+  opt_risk_pct: 5,        // 5% of account risk per option trade
+  
+  // General
+  enabled_strategies: ['scalp'], // 'scalp', 'options_mr'
+};
+
+let tradeLog = [];
+let signalLog = [];
+let stats = {
+  totalTrades: 0,
+  wins: 0,
+  losses: 0,
+  totalPnL: 0,
+  todayPnL: 0,
+  todayTrades: 0
+};
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SCALPING SIGNAL DETECTION
+// ──────────────────────────────────────────────────────────────────────────────
+function checkScalpSignal(sym, currentPrice) {
+  if (!botSettings.enabled_strategies.includes('scalp')) return;
+  if (botPositions[sym]) return; // Already in position
+  if (Object.keys(botPositions).length >= botSettings.scalp_max_positions) return;
+  
+  const ticks = tickHistory[sym];
+  if (!ticks || ticks.length < 10) return;
+
+  // Micro-momentum: Check last 10 ticks
+  const recent = ticks.slice(-10);
+  const oldest = recent[0].price;
+  const newest = recent[recent.length - 1].price;
+  const momentum = (newest - oldest) / oldest * 100;
+
+  // Calculate tick velocity (price change per tick)
+  let upTicks = 0, downTicks = 0;
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i].price > recent[i-1].price) upTicks++;
+    else if (recent[i].price < recent[i-1].price) downTicks++;
+  }
+
+  // Signal: Strong micro-momentum with consistent direction
+  const signal = {
+    sym,
+    price: currentPrice,
+    momentum: momentum.toFixed(4),
+    upTicks,
+    downTicks,
+    direction: null,
+    confidence: 0
   };
+
+  // Buy signal: 7+ up ticks out of 10, positive momentum
+  if (upTicks >= 7 && momentum > 0.02) {
+    signal.direction = 'LONG';
+    signal.confidence = Math.min(95, 50 + (upTicks * 5) + (momentum * 100));
+  }
+  // Short signal: 7+ down ticks, negative momentum (if supported)
+  // Note: Most paper accounts don't support shorting, so we skip
+  
+  if (signal.direction && signal.confidence >= 70) {
+    signalLog.unshift({ ...signal, time: new Date().toISOString() });
+    if (signalLog.length > 100) signalLog.pop();
+    
+    executeScalpEntry(sym, currentPrice, signal);
+  }
 }
 
-// Place order on Schwab paper account
+async function executeScalpEntry(sym, price, signal) {
+  const positionValue = ACCOUNT_BALANCE * (botSettings.scalp_pos_pct / 100);
+  const qty = Math.floor(positionValue / price);
+  
+  if (qty < 1) return;
+
+  console.log(`📈 SCALP ENTRY: ${sym} @ $${price.toFixed(2)} | Qty: ${qty} | Confidence: ${signal.confidence}%`);
+
+  const result = await placeSchwabOrder(sym, 'BUY', qty, price);
+  
+  if (result.success || result.simulated) {
+    botPositions[sym] = {
+      qty,
+      avgPrice: price,
+      entryTime: Date.now(),
+      side: 'LONG',
+      tp: price * (1 + botSettings.scalp_tp_pct / 100),
+      sl: price * (1 - botSettings.scalp_sl_pct / 100)
+    };
+
+    const trade = {
+      time: new Date().toISOString(),
+      side: 'BUY',
+      sym,
+      qty,
+      price,
+      strategy: 'SCALP',
+      signal: signal.confidence,
+      schwab: result
+    };
+    tradeLog.unshift(trade);
+    if (tradeLog.length > 500) tradeLog.pop();
+    
+    stats.totalTrades++;
+    stats.todayTrades++;
+
+    await tg(`📈 *SCALP ENTRY: ${sym}*
+${qty} shares @ $${price.toFixed(2)}
+Value: $${(qty * price).toFixed(2)}
+TP: $${botPositions[sym].tp.toFixed(2)} (+${botSettings.scalp_tp_pct}%)
+SL: $${botPositions[sym].sl.toFixed(2)} (-${botSettings.scalp_sl_pct}%)
+Signal: ${signal.confidence}% confidence
+${result.simulated ? '⚠️ Paper trade' : '✓ Schwab order placed'}`);
+  }
+}
+
+// Check exits on every price update
+function checkScalpExits() {
+  for (const [sym, pos] of Object.entries(botPositions)) {
+    if (!pos || pos.strategy === 'OPTIONS') continue;
+    
+    const current = priceCache[sym]?.lastPrice;
+    if (!current) continue;
+
+    let exitReason = null;
+    
+    if (current >= pos.tp) {
+      exitReason = `TAKE PROFIT (+${botSettings.scalp_tp_pct}%)`;
+    } else if (current <= pos.sl) {
+      exitReason = `STOP LOSS (-${botSettings.scalp_sl_pct}%)`;
+    }
+
+    if (exitReason) {
+      executeScalpExit(sym, current, exitReason);
+    }
+  }
+}
+
+async function executeScalpExit(sym, price, reason) {
+  const pos = botPositions[sym];
+  if (!pos) return;
+
+  console.log(`📉 SCALP EXIT: ${sym} @ $${price.toFixed(2)} | ${reason}`);
+
+  const result = await placeSchwabOrder(sym, 'SELL', pos.qty, price);
+  
+  const pnl = (price - pos.avgPrice) * pos.qty;
+  const pnlPct = (price - pos.avgPrice) / pos.avgPrice * 100;
+  const holdTime = ((Date.now() - pos.entryTime) / 1000).toFixed(1);
+
+  const trade = {
+    time: new Date().toISOString(),
+    side: 'SELL',
+    sym,
+    qty: pos.qty,
+    price,
+    pnl: pnl.toFixed(2),
+    pnlPct: pnlPct.toFixed(3),
+    reason,
+    holdTime: `${holdTime}s`,
+    strategy: 'SCALP',
+    schwab: result
+  };
+  tradeLog.unshift(trade);
+  if (tradeLog.length > 500) tradeLog.pop();
+
+  stats.totalPnL += pnl;
+  stats.todayPnL += pnl;
+  if (pnl > 0) stats.wins++;
+  else stats.losses++;
+
+  delete botPositions[sym];
+
+  const emoji = pnl >= 0 ? '✅' : '❌';
+  await tg(`${emoji} *SCALP EXIT: ${sym}*
+${pos.qty} shares @ $${price.toFixed(2)}
+P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(3)}%)
+Hold time: ${holdTime}s
+Reason: ${reason}
+${result.simulated ? '⚠️ Paper trade' : '✓ Schwab order placed'}`);
+}
+
+// Check exits frequently
+setInterval(checkScalpExits, 100); // Every 100ms
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SCHWAB ORDER EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
 async function placeSchwabOrder(sym, side, qty, price) {
   const token = await getSchwabToken();
   const hash = await getSchwabAccountHash();
+  
   if (!token || !hash) {
-    console.log('Schwab not connected — paper trade only');
-    return { simulated: true };
+    console.log('⚠ Schwab not connected — simulating order');
+    return { simulated: true, side, sym, qty, price };
   }
+
   try {
     const order = {
       orderType: 'MARKET',
@@ -307,6 +663,7 @@ async function placeSchwabOrder(sym, side, qty, price) {
         instrument: { symbol: sym, assetType: 'EQUITY' }
       }]
     };
+
     const r = await fetch(`https://api.schwabapi.com/trader/v1/accounts/${hash}/orders`, {
       method: 'POST',
       headers: {
@@ -315,101 +672,84 @@ async function placeSchwabOrder(sym, side, qty, price) {
       },
       body: JSON.stringify(order)
     });
+
     if (r.status === 201) {
-      console.log(`Schwab order placed: ${side} ${qty} ${sym}`);
-      return { success: true, status: r.status };
+      const location = r.headers.get('location');
+      const orderId = location?.split('/').pop();
+      console.log(`✓ Schwab order placed: ${side} ${qty} ${sym} | Order ID: ${orderId}`);
+      return { success: true, orderId, status: r.status };
     } else {
       const err = await r.text();
-      console.error(`Schwab order failed: ${r.status}`, err);
-      return { success: false, error: err };
+      console.error(`✗ Schwab order failed: ${r.status}`, err);
+      return { success: false, error: err, simulated: true };
     }
   } catch(e) {
-    console.error('Schwab order error:', e.message);
-    return { success: false, error: e.message };
+    console.error('✗ Schwab order error:', e.message);
+    return { success: false, error: e.message, simulated: true };
   }
 }
 
-// Bot scan loop
-async function runBotScan() {
-  if (!botRunning) return;
+// ══════════════════════════════════════════════════════════════════════════════
+// OPTIONS MEAN REVERSION (Coming soon)
+// ══════════════════════════════════════════════════════════════════════════════
+// TODO: Implement options chain fetching and trading
+// RSI < 28 + below BB lower → buy ATM calls, 30 DTE
+// RSI > 72 + above BB upper → buy ATM puts, 30 DTE
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MARKET HOURS CHECK
+// ══════════════════════════════════════════════════════════════════════════════
+function isMarketOpen() {
   const now = new Date();
-  // Only trade during market hours ET (9:30am - 4:00pm)
   const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   const h = et.getHours(), m = et.getMinutes(), dow = et.getDay();
   const mins = h * 60 + m;
-  const isMarketHours = dow >= 1 && dow <= 5 && mins >= 570 && mins < 960;
-  if (!isMarketHours) return;
-
-  for (const sym of SYMBOLS) {
-    const p = priceCache[sym]?.schwab?.c || priceCache[sym]?.finnhub?.c;
-    if (!p) continue;
-    const sig = analyze(sym);
-    const pos = botPositions[sym];
-
-    if (pos) {
-      // Check sell conditions
-      const pnlPct = (p - pos.avgPrice) / pos.avgPrice * 100;
-      let reason = null;
-      if (pnlPct <= -botSettings.slPct) reason = `STOP LOSS (${pnlPct.toFixed(2)}%)`;
-      else if (pnlPct >= botSettings.tpPct) reason = `TAKE PROFIT (+${pnlPct.toFixed(2)}%)`;
-      else if (sig.sellSignal) reason = 'INDICATOR SELL';
-      if (reason) {
-        const result = await placeSchwabOrder(sym, 'SELL', pos.qty, p);
-        const pnl = (p - pos.avgPrice) * pos.qty;
-        cash += p * pos.qty;
-        const trade = { time: new Date().toISOString(), side: 'SELL', sym, qty: pos.qty, price: p, pnl: pnl.toFixed(2), reason, schwab: result };
-        tradeLog.unshift(trade);
-        if (tradeLog.length > 200) tradeLog.pop();
-        delete botPositions[sym];
-        const emoji = pnl >= 0 ? '✅' : '❌';
-        await tg(`${emoji} *SELL ${sym}*\n${pos.qty} shares @ $${p.toFixed(2)}\nP&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)\nReason: ${reason}\n${result.simulated ? '⚠️ Simulated (Schwab not connected)' : '✓ Placed on Schwab'}`);
-      }
-    } else {
-      // Check buy conditions
-      if (sig.buyGate && sig.confidence >= botSettings.minConf) {
-        const maxVal = cash * (botSettings.maxPosPct / 100);
-        const qty = Math.floor(maxVal / p);
-        if (qty > 0 && cash >= qty * p) {
-          const result = await placeSchwabOrder(sym, 'BUY', qty, p);
-          cash -= p * qty;
-          botPositions[sym] = { qty, avgPrice: p, entryTime: new Date().toISOString() };
-          const trade = { time: new Date().toISOString(), side: 'BUY', sym, qty, price: p, pnl: null, reason: `ALL 4 PASS (${sig.confidence}%)`, schwab: result };
-          tradeLog.unshift(trade);
-          if (tradeLog.length > 200) tradeLog.pop();
-          await tg(`📈 *BUY ${sym}*\n${qty} shares @ $${p.toFixed(2)}\nTotal: $${(qty*p).toFixed(2)}\nSignal: All 4 strategies agree (${sig.confidence}%)\n${result.simulated ? '⚠️ Simulated (Schwab not connected)' : '✓ Placed on Schwab'}`);
-        }
-      }
-    }
-  }
+  // 9:30 AM = 570 mins, 4:00 PM = 960 mins
+  return dow >= 1 && dow <= 5 && mins >= 570 && mins < 960;
 }
 
-// Run bot scan every 30s
-setInterval(runBotScan, 30000);
+function getMarketStatus() {
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const h = et.getHours(), m = et.getMinutes(), dow = et.getDay();
+  const mins = h * 60 + m;
+  
+  if (dow === 0 || dow === 6) return 'WEEKEND';
+  if (mins < 570) return 'PRE-MARKET';
+  if (mins >= 960) return 'AFTER-HOURS';
+  return 'OPEN';
+}
 
-// ── ROUTES ────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// API ROUTES
+// ══════════════════════════════════════════════════════════════════════════════
 app.get('/', (req, res) => {
   res.json({
-    status: 'SOCA Proxy running',
+    status: 'SOCA HFT Engine Running',
+    version: '2.0.0',
     dataSource,
     schwabConnected: schwabReady(),
-    cacheReady,
+    streamerConnected,
     lastCacheUpdate,
     cachedSymbols: Object.keys(priceCache).length,
     botRunning,
-    openPositions: Object.keys(botPositions).length
+    marketStatus: getMarketStatus(),
+    openPositions: Object.keys(botPositions).length,
+    stats
   });
 });
 
-// Schwab OAuth — Step 1: get login URL
+// Schwab OAuth — Step 1
 app.get('/auth', (req, res) => {
   const url = `https://api.schwabapi.com/v1/oauth/authorize?client_id=${SCHWAB_KEY}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code`;
   res.redirect(url);
 });
 
-// Schwab OAuth — Step 2: handle callback
+// Schwab OAuth — Step 2
 app.get('/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing authorization code');
+  
   try {
     const creds = Buffer.from(`${SCHWAB_KEY}:${SCHWAB_SECRET}`).toString('base64');
     const r = await fetch('https://api.schwabapi.com/v1/oauth/token', {
@@ -418,20 +758,31 @@ app.get('/callback', async (req, res) => {
       body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: REDIRECT_URI })
     });
     const d = await r.json();
+    
     if (d.access_token) {
       schwabTokens.access_token  = d.access_token;
       schwabTokens.refresh_token = d.refresh_token;
       schwabTokens.expires_at    = Date.now() + (d.expires_in - 60) * 1000;
+      
       await getSchwabAccountHash();
-      await fetchSchwabPrices();
-      await tg('🟢 *SOCA Bot connected to Schwab!*\nReal-time prices active. Bot ready to trade.');
+      await connectStreamer();
+      
+      await tg(`🟢 *SOCA HFT Bot Connected!*
+Account: ${schwabTokens.account_hash?.slice(0,8)}...
+Streamer: ${streamerConnected ? '✓ Connected' : '⚠️ Fallback to polling'}
+Symbols: ${SCALP_SYMBOLS.length}
+Ready to scalp!`);
+
       res.send(`
-        <html><body style="font-family:Arial;text-align:center;padding:60px;background:#f5f5f5">
-        <h2 style="color:#1f3864">✅ Schwab Connected!</h2>
-        <p>Real-time prices are now active.</p>
-        <p>You can close this tab and return to your dashboard.</p>
-        <p style="color:#888;font-size:12px">Account hash: ${schwabTokens.account_hash || 'loading...'}</p>
-        </body></html>
+        <html>
+        <body style="font-family:system-ui;background:#0a0a0a;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+          <div style="text-align:center">
+            <h1 style="color:#00ff88">✓ SOCA Connected!</h1>
+            <p>Streaming: ${streamerConnected ? 'Active' : 'Polling mode'}</p>
+            <p style="color:#666">You can close this tab</p>
+          </div>
+        </body>
+        </html>
       `);
     } else {
       res.status(400).send('Auth failed: ' + JSON.stringify(d));
@@ -441,48 +792,88 @@ app.get('/callback', async (req, res) => {
   }
 });
 
-// Quotes — from cache, instant
+// Get quotes
 app.get('/quote/:symbols', (req, res) => {
   const requested = [...new Set(req.params.symbols.toUpperCase().split(','))];
   const tickers = requested.map(sym => priceCache[sym] || null).filter(Boolean);
-  res.json({ tickers, fromCache: true, dataSource, lastUpdate: lastCacheUpdate, ready: cacheReady });
-});
-
-// Candles via Polygon
-app.get('/candles/:sym/:mult/:span/:from/:to', async (req, res) => {
-  if (!POLYGON_KEY) return res.status(500).json({ error: 'POLYGON_KEY not set' });
-  try {
-    const { sym, mult, span, from, to } = req.params;
-    const r = await fetch(`https://api.polygon.io/v2/aggs/ticker/${sym}/range/${mult}/${span}/${from}/${to}?adjusted=true&sort=asc&limit=1000&apiKey=${POLYGON_KEY}`);
-    res.json(await r.json());
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  res.json({ 
+    tickers, 
+    dataSource, 
+    streamerConnected,
+    lastUpdate: lastCacheUpdate 
+  });
 });
 
 // Bot control
 app.post('/bot/start', async (req, res) => {
-  if (req.body.settings) botSettings = { ...botSettings, ...req.body.settings };
+  if (req.body.settings) {
+    botSettings = { ...botSettings, ...req.body.settings };
+  }
+  
   botRunning = true;
-  console.log('Bot started');
-  await tg(`▶️ *SOCA Bot STARTED*\nWatching ${SYMBOLS.length} stocks\nSL: ${botSettings.slPct}%  TP: ${botSettings.tpPct}%\nData: ${dataSource}\nSchwab: ${schwabReady() ? '✓ connected' : '⚠️ not connected'}`);
-  res.json({ ok: true, botRunning, settings: botSettings });
+  
+  // Connect streamer if not already
+  if (!streamerConnected && schwabReady()) {
+    await connectStreamer();
+  }
+  
+  console.log('▶ Bot started');
+  await tg(`▶️ *SOCA HFT Bot STARTED*
+Symbols: ${SCALP_SYMBOLS.join(', ')}
+Scalp TP: ${botSettings.scalp_tp_pct}% | SL: ${botSettings.scalp_sl_pct}%
+Position size: ${botSettings.scalp_pos_pct}% ($${(ACCOUNT_BALANCE * botSettings.scalp_pos_pct / 100).toLocaleString()})
+Max positions: ${botSettings.scalp_max_positions}
+Data: ${dataSource}
+Streamer: ${streamerConnected ? '✓ Real-time' : '⚠️ Polling'}`);
+
+  res.json({ ok: true, botRunning, settings: botSettings, streamerConnected });
 });
 
 app.post('/bot/stop', async (req, res) => {
   botRunning = false;
-  console.log('Bot stopped');
-  const totalPnl = tradeLog.filter(t=>t.side==='SELL').reduce((s,t)=>s+(parseFloat(t.pnl)||0),0);
-  await tg(`⏹️ *SOCA Bot STOPPED*\nTrades: ${tradeLog.length}\nTotal P&L: ${totalPnl>=0?'+':''}$${totalPnl.toFixed(2)}\nOpen positions: ${Object.keys(botPositions).length}`);
-  res.json({ ok: true, botRunning });
+  
+  console.log('⏹ Bot stopped');
+  const winRate = stats.totalTrades > 0 ? (stats.wins / stats.totalTrades * 100).toFixed(1) : 0;
+  
+  await tg(`⏹️ *SOCA Bot STOPPED*
+Trades: ${stats.totalTrades} (${stats.wins}W/${stats.losses}L)
+Win rate: ${winRate}%
+Total P&L: ${stats.totalPnL >= 0 ? '+' : ''}$${stats.totalPnL.toFixed(2)}
+Open positions: ${Object.keys(botPositions).length}`);
+
+  res.json({ ok: true, botRunning, stats });
 });
 
 app.get('/bot/status', (req, res) => {
   const positions = Object.entries(botPositions).map(([sym, pos]) => {
-    const cur = priceCache[sym]?.schwab?.c || priceCache[sym]?.finnhub?.c || pos.avgPrice;
+    const cur = priceCache[sym]?.lastPrice || pos.avgPrice;
     const pnl = (cur - pos.avgPrice) * pos.qty;
     const pnlPct = (cur - pos.avgPrice) / pos.avgPrice * 100;
-    return { sym, qty: pos.qty, avgPrice: pos.avgPrice, currentPrice: cur, pnl: +pnl.toFixed(2), pnlPct: +pnlPct.toFixed(2), entryTime: pos.entryTime };
+    return { 
+      sym, 
+      qty: pos.qty, 
+      avgPrice: pos.avgPrice, 
+      currentPrice: cur, 
+      pnl: +pnl.toFixed(2), 
+      pnlPct: +pnlPct.toFixed(3),
+      tp: pos.tp,
+      sl: pos.sl,
+      holdTime: ((Date.now() - pos.entryTime) / 1000).toFixed(1) + 's'
+    };
   });
-  res.json({ botRunning, positions, tradeLog: tradeLog.slice(0, 50), cash, settings: botSettings, dataSource, schwabConnected: schwabReady() });
+
+  res.json({ 
+    botRunning, 
+    positions, 
+    tradeLog: tradeLog.slice(0, 100),
+    signalLog: signalLog.slice(0, 50),
+    stats,
+    settings: botSettings, 
+    dataSource, 
+    streamerConnected,
+    marketStatus: getMarketStatus(),
+    schwabConnected: schwabReady()
+  });
 });
 
 app.post('/bot/settings', (req, res) => {
@@ -490,30 +881,63 @@ app.post('/bot/settings', (req, res) => {
   res.json({ ok: true, settings: botSettings });
 });
 
-// Close all positions
 app.post('/bot/closeall', async (req, res) => {
   const syms = Object.keys(botPositions);
+  let closed = 0;
+  
   for (const sym of syms) {
     const pos = botPositions[sym];
-    const p = priceCache[sym]?.schwab?.c || priceCache[sym]?.finnhub?.c || pos.avgPrice;
-    await placeSchwabOrder(sym, 'SELL', pos.qty, p);
-    const pnl = (p - pos.avgPrice) * pos.qty;
-    tradeLog.unshift({ time: new Date().toISOString(), side: 'SELL', sym, qty: pos.qty, price: p, pnl: pnl.toFixed(2), reason: req.body.reason || 'MANUAL CLOSE ALL' });
-    cash += p * pos.qty;
-    delete botPositions[sym];
+    const price = priceCache[sym]?.lastPrice || pos.avgPrice;
+    await executeScalpExit(sym, price, req.body.reason || 'MANUAL CLOSE ALL');
+    closed++;
   }
-  res.json({ ok: true, closed: syms.length });
+  
+  res.json({ ok: true, closed });
 });
 
 // Debug
 app.get('/debug/:sym', (req, res) => {
   const sym = req.params.sym.toUpperCase();
-  res.json({ sym, cached: priceCache[sym] || null, dataSource, schwabConnected: schwabReady(), lastUpdate: lastCacheUpdate });
+  res.json({ 
+    sym, 
+    cached: priceCache[sym] || null, 
+    ticks: tickHistory[sym]?.slice(-20) || [],
+    position: botPositions[sym] || null,
+    dataSource, 
+    streamerConnected,
+    lastUpdate: lastCacheUpdate 
+  });
 });
 
-app.listen(PORT, () => {
-  console.log(`SOCA Proxy on port ${PORT}`);
-  console.log(`Schwab: ${SCHWAB_KEY ? 'key set' : 'MISSING KEY'}`);
-  console.log(`Finnhub: ${FINNHUB_KEY ? 'key set' : 'MISSING'}`);
-  console.log(`Polygon: ${POLYGON_KEY ? 'key set' : 'MISSING'}`);
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    ok: true, 
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    streamerConnected,
+    schwabConnected: schwabReady()
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STARTUP
+// ══════════════════════════════════════════════════════════════════════════════
+app.listen(PORT, async () => {
+  console.log(`
+╔══════════════════════════════════════════════════════════════╗
+║              SOCA HFT SCALPING ENGINE v2.0                   ║
+╠══════════════════════════════════════════════════════════════╣
+║  Port: ${PORT}                                                    ║
+║  Schwab: ${SCHWAB_KEY ? '✓ Key configured' : '✗ MISSING KEY'}                              ║
+║  Telegram: ${TG_TOKEN ? '✓ Configured' : '⚠️ Not configured'}                              ║
+║  Symbols: ${SCALP_SYMBOLS.length} stocks                                        ║
+║  Scalp: ${botSettings.scalp_tp_pct}% TP / ${botSettings.scalp_sl_pct}% SL                                    ║
+╚══════════════════════════════════════════════════════════════╝
+  `);
+
+  // Initial price fetch
+  if (SCHWAB_KEY) {
+    await fetchSchwabPrices();
+  }
 });
